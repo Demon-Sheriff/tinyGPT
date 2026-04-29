@@ -114,6 +114,17 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    tying_state: str = "tied" # weight tying enabled by default ("tied"), other options : "untied", "split"
+
+class LoRASplitTying(nn.Module):
+
+    def __init__(self, config, r=64):
+        super().__init__()
+        self.A_in = nn.Parameter(torch.zeros(config.vocab_size, r)) # V x r
+        self.B_in = nn.Parameter(torch.randn(r, config.n_embd) * 0.01) # r x D
+        self.A_out = nn.Parameter(torch.zeros(config.vocab_size, r)) # V x r
+        self.B_out = nn.Parameter(torch.randn(r, config.n_embd) * 0.01) # r x D
+    
 
 class GPT(nn.Module):
 
@@ -135,7 +146,12 @@ class GPT(nn.Module):
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        if self.config.tying_state == "tied":
+            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        elif self.config.tying_state == "split":
+            # the update has to be E = B + A_in.C_in, lm_head = B + A_out.C_out
+            self.lst = LoRASplitTying(config)
+            self.transformer.wte.weight = self.lm_head.weight # the shared base
 
         # init all weights
         self.apply(self._init_weights)
@@ -173,8 +189,14 @@ class GPT(nn.Module):
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        # forward the GPT model itsel
+        if self.config.tying_state == "split":
+            E = self.lm_head.weight + self.lst.A_in @ self.lst.B_in # the embedding layer
+            W_out = self.lm_head.weight + self.lst.A_out @ self.lst.B_out # the lm head layer
+            tok_emb = F.embedding(idx, E)
+        else:
+            W_out = self.lm_head.weight
+            tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
@@ -183,11 +205,11 @@ class GPT(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            logits = F.linear(x, W_out)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = F.linear(x[:, [-1], :], W_out) # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss

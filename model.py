@@ -191,8 +191,9 @@ class GPT(nn.Module):
 
         # forward the GPT model itsel
         if self.config.tying_state == "split":
-            E = self.lm_head.weight + self.lst.A_in @ self.lst.B_in # the embedding layer
-            W_out = self.lm_head.weight + self.lst.A_out @ self.lst.B_out # the lm head layer
+            base = self.lm_head.weight
+            E = base + (self.lst.A_in @ self.lst.B_in).to(base.dtype)
+            W_out = base + (self.lst.A_out @ self.lst.B_out).to(base.dtype)
             tok_emb = F.embedding(idx, E)
         else:
             W_out = self.lm_head.weight

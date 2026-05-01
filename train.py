@@ -26,6 +26,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+import torch.nn.functional as F
 
 from model import GPTConfig, GPT
 
@@ -131,6 +132,23 @@ def get_batch(split):
         x, y = x.to(device), y.to(device)
     return x, y
 
+# compute one-time bins based on token frequencies.
+data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+token_counts = np.bincount(data, minlength=50304)
+rank = np.empty(len(token_counts), dtype=np.int64)
+rank[np.argsort(-token_counts)] = np.arange(len(token_counts))
+
+num_bins = 6
+token_bins = np.zeros(50304, dtype=np.int32)
+token_bins[rank < 1000] = 0
+token_bins[(rank >= 1000) & (rank < 10000)] = 1
+token_bins[(rank >= 10000) & (rank < 20000)] = 2
+token_bins[(rank >= 20000) & (rank < 30000)] = 3
+token_bins[(rank >= 30000) & (rank < 40000)] = 4
+token_bins[(rank >= 40000)] = 5
+token_bins = torch.from_numpy(token_bins)  # move to tensor for GPU indexing later
+del data  # release memmap
+
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
@@ -212,6 +230,140 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+# gradient conflict between input and output pathways (tied models only)
+def measure_gradient_conflict(raw_model):
+    if raw_model.config.tying_state != "tied":
+        return {}
+
+    raw_model.eval()
+    raw_model.zero_grad()
+
+    h_captured = {}
+    hook = raw_model.transformer.ln_f.register_forward_hook(
+        lambda m, inp, out: h_captured.update({'h': out.detach()})
+    )
+
+    X, Y = get_batch('val')
+    X, Y = X[:8], Y[:8]
+    with ctx:
+        logits, loss = raw_model(X, Y)
+    logits.retain_grad()
+    loss.backward()
+    hook.remove()
+
+    g_total = raw_model.lm_head.weight.grad.float()
+    dlogits = logits.grad.view(-1, logits.size(-1)).float()
+    h = h_captured['h'].view(-1, raw_model.config.n_embd).float()
+    g_out = dlogits.T @ h
+    g_in = g_total - g_out
+    assert (g_in + g_out - g_total).norm() / g_total.norm() < 1e-4, "gradient decomposition broken"
+
+    cos = F.cosine_similarity(g_in, g_out, dim=1)
+
+    result = {
+        "conflict/mean_cosine": cos.mean().item(),
+        "conflict/frac_negative": (cos < 0).float().mean().item(),
+    }
+    for b in range(num_bins):
+        mask = (token_bins == b)
+        if mask.any():
+            result[f"conflict/bin{b}_cosine"] = cos[mask].mean().item()
+
+    raw_model.zero_grad(set_to_none=True)
+    raw_model.train()
+    return result
+
+# gradient bottleneck severity (Godey & Artzi 2026, Eq. 10)
+def measure_bottleneck(raw_model, num_batches=4):
+    was_training = raw_model.training
+    raw_model.eval()
+    frac_destroyed_sum = 0.0
+    cos_sim_sum = 0.0
+    W = raw_model.lm_head.weight.detach().float()
+    Q_range, _ = torch.linalg.qr(W)
+    for _ in range(num_batches):
+        X, Y = get_batch('val')
+        X, Y = X[:8], Y[:8]
+        with ctx:
+            logits, loss = raw_model(X, Y)
+        logits.retain_grad()
+        loss.backward()
+        g = logits.grad.view(-1, logits.size(-1)).detach().float()
+        g_projected = g @ Q_range @ Q_range.T
+        frac_preserved = (g_projected.norm() ** 2) / (g.norm() ** 2)
+        frac_destroyed_sum += 1.0 - frac_preserved.item()
+        cos_sim_sum += F.cosine_similarity(g.reshape(1, -1), g_projected.reshape(1, -1)).item()
+        raw_model.zero_grad(set_to_none=True)
+    if was_training:
+        raw_model.train()
+    return {
+        "bottleneck/frac_destroyed": frac_destroyed_sum / num_batches,
+        "bottleneck/cosine_sim": cos_sim_sum / num_batches,
+    }
+
+# svd spectrum of the embedding matrices
+@torch.no_grad()
+def svd_spectrum(raw_model):
+    if raw_model.config.tying_state == "split":
+        base = raw_model.lm_head.weight
+        e = base + (raw_model.lst.A_in @ raw_model.lst.B_in).to(base.dtype)
+    else:
+        e = raw_model.transformer.wte.weight
+    s = torch.linalg.svdvals(e.detach().float())
+
+    var = s ** 2
+
+    pr = (s.sum() ** 2) / var.sum()
+
+    cumvar = torch.cumsum(var, dim=0) / var.sum()
+    dims_for_90 = (cumvar < 0.90).sum().item() + 1
+    dims_for_95 = (cumvar < 0.95).sum().item() + 1
+    dims_for_99 = (cumvar < 0.99).sum().item() + 1
+
+    p = var / var.sum()
+    eff_rank = torch.exp(-torch.sum(p * torch.log(p + 1e-10)))
+
+    return {
+        "svd/spectrum": wandb.Histogram(s.cpu().numpy()),
+        "svd/participation_ratio": pr.item(),
+        "svd/dims_for_90pct": dims_for_90,
+        "svd/dims_for_95pct": dims_for_95,
+        "svd/dims_for_99pct": dims_for_99,
+        "svd/effective_rank": eff_rank.item(),
+    }
+
+# rare-token perplexity
+@torch.no_grad()
+def rare_token_perplexity():
+    """returns rare token perplexity based on token bins"""
+    # use the global `token_bins`
+    model.eval()
+    out = {}
+    for split in ['train', 'val']:
+        # losses = torch.zeros(eval_iters, num_bins) # (k, num_bins)
+        losses = torch.zeros(eval_iters, num_bins)
+        # estimate loss over `eval_iters` steps
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            with ctx:
+                logits, _ = model(X, Y)
+            # calculate per token loss
+            per_token_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1), reduction='none') # (B*T)
+            # assign the token to its correct bin
+            bins = token_bins.to(Y.device)[Y.view(-1)] # (B*T)
+            # compute loss per bin
+            for _bin in range(num_bins):
+                mask = (bins == _bin) # create a bool mask for the current bin, ex: bin=0 gets a flag where in is 0: bins[1, 1, 1, 0, 0, 1, 0, 1, ...]
+                if mask.any(): # if even a single token is from the current bin then calc it loss
+                    bin_loss = per_token_loss[mask].mean()
+                    # bin_loss_dict[_bin] = (bin_loss.item(), bin_ppl.item())
+                    losses[k, _bin] = bin_loss.item()
+            
+        loss = losses.mean(-2) # mean of the metrics along k dim # (num_bins)
+        out[split] = loss
+    model.train()
+    return out
+
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
@@ -263,15 +415,28 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
+        bin_losses = rare_token_perplexity()
+        svd_metrics = svd_spectrum(raw_model)
+        bottleneck_metrics = measure_bottleneck(raw_model)
+        conflict_metrics = measure_gradient_conflict(raw_model)
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
-            wandb.log({
+            log_dict = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
+            }
+            for b in range(num_bins):
+                log_dict[f"train/bin{b}_loss"] = bin_losses['train'][b].item()
+                log_dict[f"train/bin{b}_ppl"] = bin_losses['train'][b].exp().item()
+                log_dict[f"val/bin{b}_loss"] = bin_losses['val'][b].item()
+                log_dict[f"val/bin{b}_ppl"] = bin_losses['val'][b].exp().item()
+            log_dict.update(svd_metrics)
+            log_dict.update(bottleneck_metrics)
+            log_dict.update(conflict_metrics)
+            wandb.log(log_dict)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
